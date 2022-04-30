@@ -2,7 +2,7 @@ run:
 	go mod tidy
 	go fmt .
 	if [[ -f .env ]]; then set -o allexport; source .env; fi; \
-		go run .
+		go run . --dry --file secrets.yml
 
 # Checkout `-buildvcs` option to `go build`, which is enabled by default.
 build: bin
