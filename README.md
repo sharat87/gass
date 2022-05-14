@@ -6,13 +6,13 @@ A tiny tool to set secrets for one or more GitHub repos, as specified in a YAML 
 repos:
   - owner: sharat87
     name: prestige
-    deleteUnspecified: false  # If true, delete any secrets not mentioned in the below `secrets` list. Defaults to `false` if not specified.
+    delete_unspecified: false  # If true, delete any secrets not mentioned in the below `secrets` list. Defaults to `false` if not specified.
     secrets:
       SOME_SECRET_NAME: super-secret-value
 
   - owner: sharat87
     name: just-a-calendar
-    deleteUnspecified: false
+    delete_unspecified: false
     secrets:
       ANOTHER_SECRET: value1
       SOME_LONG_SSH_KEY: |
@@ -77,7 +77,7 @@ repos:
 
   - owner: sharat87
     name: prestige
-    deleteUnspecified: true
+    delete_unspecified: true
     secrets:
       AWS_ACCESS_KEY_ID: *artifacts_aws_key
       AWS_SECRET_ACCESS_KEY: *artifacts_aws_secret
@@ -85,7 +85,7 @@ repos:
 
   - owner: sharat87
     name: httpbun
-    deleteUnspecified: true
+    delete_unspecified: true
     secrets:
       AWS_ACCESS_KEY_ID: *artifacts_aws_key
       AWS_SECRET_ACCESS_KEY: *artifacts_aws_secret
@@ -103,14 +103,14 @@ repos:
 
   - owner: sharat87
     name: prestige
-    deleteUnspecified: true
+    delete_unspecified: true
     secrets:
       <<: *artifacts_aws
       SOME_OTHER_SECRET: "a-super-awesome-secret"
 
   - owner: sharat87
     name: httpbun
-    deleteUnspecified: true
+    delete_unspecified: true
     secrets:
       <<: *artifacts_aws
 ```

@@ -1,15 +1,14 @@
 package main
 
 import (
-	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/sharat87/gass/github"
 	"golang.org/x/crypto/nacl/box"
 	"gopkg.in/yaml.v2"
-	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -17,8 +16,6 @@ import (
 	"regexp"
 	"strings"
 )
-
-var GITHUB_TOKEN = os.Getenv("GITHUB_API_TOKEN")
 
 // Styles codes from <https://stackoverflow.com/a/33206814/151048>.
 const STYLE_RESET = "\033[0m"
@@ -30,9 +27,8 @@ const STYLE_BOLD = "\033[1m"
 const STYLE_REVERSE = "\033[7m"
 
 type InvokeArgs struct {
-	Action string
-	IsDry  bool
-	Files  []string
+	IsDry bool
+	Files []string
 }
 
 type PublicKey struct {
@@ -46,16 +42,31 @@ type SecretValue struct {
 	FromEnv string
 }
 
+type SecretValueSpec struct {
+	Name             string
+	Value            string
+	FromEnv          string
+	OrgVisibility    string   `yaml:"visibility"`
+	OrgSelectedRepos []string `yaml:"selected_repos"`
+}
+
 type SyncSpecRepo struct {
 	Owner   string
 	Name    string
-	Delete  bool `yaml:"deleteUnspecified"`
-	Secrets map[string]SecretValue
+	Delete  bool `yaml:"delete_unspecified"`
+	Secrets []SecretValueSpec
+}
+
+type SyncSpecOrg struct {
+	Name    string
+	Delete  bool `yaml:"delete_unspecified"`
+	Secrets []SecretValueSpec
 }
 
 type SyncSpec struct {
 	Vars  interface{}
 	Repos []SyncSpecRepo
+	Orgs  []SyncSpecOrg
 }
 
 type QualifiedSecretCallsByRepo struct {
@@ -66,32 +77,20 @@ type QualifiedSecretCallsByRepo struct {
 	UsedSecrets map[string]map[string]interface{}
 }
 
+type QualifiedSecretCallsByOrg struct {
+	KeyId   string
+	OrgName string
+	Calls   []QualifiedSecretCall
+	// TODO: We aren't inspecting used secrets in orgs yet.
+	UsedSecrets map[string]map[string]interface{}
+}
+
 type QualifiedSecretCall struct {
 	Call           string // "create", "update", or "delete".
 	SecretName     string
 	EncryptedValue string // empty if `Call` is "delete".
-}
-
-func (sv *SecretValue) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	stringValue := ""
-	if unmarshal(&stringValue) == nil {
-		sv.Type = "value"
-		sv.Value = stringValue
-		return nil
-	}
-
-	mapValue := make(map[string]string)
-	if unmarshal(&mapValue) == nil {
-		if envName, ok := mapValue["fromEnv"]; ok {
-			sv.Type = "fromEnv"
-			sv.FromEnv = envName
-			return nil
-		}
-
-		return errors.New("No `fromEnv` found in map value for secret.")
-	}
-
-	return errors.New("Invalid type for secret value")
+	OrgVisibility  string // "org", "private", or "selected".
+	OrgRepoIds     []int  // only applicable if `OrgVisibility` is "selected".
 }
 
 func (sv SecretValue) GetRealizedValue() (string, error) {
@@ -101,6 +100,15 @@ func (sv SecretValue) GetRealizedValue() (string, error) {
 		return os.Getenv(sv.FromEnv), nil
 	}
 	return "", errors.New("Invalue type in SecretValue " + sv.Type)
+}
+
+func (sv SecretValueSpec) GetRealizedValue() (string, error) {
+	if sv.FromEnv == "" {
+		return sv.Value, nil
+	} else if sv.Value == "" {
+		return os.Getenv(sv.FromEnv), nil
+	}
+	return "", errors.New("Both `Value` and `FromEnv` were provided in SecretValueSpec")
 }
 
 func main() {
@@ -116,9 +124,9 @@ func main() {
 	}
 
 	allChanges := []QualifiedSecretCallsByRepo{}
+	allChangesForOrgs := []QualifiedSecretCallsByOrg{}
 
 	for _, file := range ia.Files {
-
 		secretsConfig := loadYaml(file)
 
 		for _, repo := range secretsConfig.Repos {
@@ -128,13 +136,68 @@ func main() {
 			thisRepoChanges.UsedSecrets, _ = getUsedSecrets(repo.Owner, repo.Name)
 			allChanges = append(allChanges, *thisRepoChanges)
 		}
+
+		for _, org := range secretsConfig.Orgs {
+			publicKey := getPublicKeyForOrg(org.Name)
+			thisOrgChanges := computeCallsForOrg(org, publicKey, ia.IsDry)
+			thisOrgChanges.KeyId = publicKey.KeyId
+			// thisOrgChanges.UsedSecrets, _ = getUsedSecrets(org.Name)
+			allChangesForOrgs = append(allChangesForOrgs, *thisOrgChanges)
+		}
 	}
 
 	// Also find used secrets that aren't set on the repo, and aren't given in the yml file here either.
 	isUsedSecretsSetForDeletion := 0
 
+	for _, org := range allChangesForOrgs {
+		fmt.Println(STYLE_BOLD + "org  " + org.OrgName + STYLE_RESET)
+
+		specifiedSecrets := map[string]interface{}{}
+
+		for _, call := range org.Calls {
+			if call.Call == "delete" {
+				msg := "\t" + STYLE_RED + "deleted\t" + call.SecretName
+
+				if _, ok := org.UsedSecrets[call.SecretName]; ok {
+					isUsedSecretsSetForDeletion += 1
+					msg += STYLE_BOLD + " " + STYLE_REVERSE + "(used in "
+					isFirst := true
+					for file, _ := range org.UsedSecrets[call.SecretName] {
+						msg += "'" + file + "'"
+						if !isFirst {
+							msg += ", "
+						}
+						isFirst = false
+					}
+					msg += ")"
+				}
+
+				fmt.Println(msg + STYLE_RESET)
+
+			} else if call.Call == "create" {
+				// TODO: Check if this is an unused secret, and if yes, show a info message.
+				fmt.Println("\t" + STYLE_GREEN + "created\t" + call.SecretName + STYLE_RESET)
+				specifiedSecrets[call.SecretName] = nil
+
+			} else if call.Call == "update" {
+				// TODO: Check if this is an unused secret, and if yes, show a info message.
+				fmt.Println("\t" + STYLE_BLUE + "updated\t" + call.SecretName + STYLE_RESET)
+				specifiedSecrets[call.SecretName] = nil
+
+			}
+		}
+
+		for usedSecret, _ := range org.UsedSecrets {
+			if _, ok := specifiedSecrets[usedSecret]; !ok {
+				fmt.Println("\t" + STYLE_MAGENTA + "missing\t" + usedSecret + STYLE_RESET)
+			}
+		}
+
+		fmt.Println("")
+	}
+
 	for _, repo := range allChanges {
-		fmt.Println(STYLE_BOLD + repo.RepoOwner + "/" + repo.RepoName + STYLE_RESET)
+		fmt.Println(STYLE_BOLD + "repo " + repo.RepoOwner + "/" + repo.RepoName + STYLE_RESET)
 
 		specifiedSecrets := map[string]interface{}{}
 
@@ -189,22 +252,43 @@ func main() {
 	if ia.IsDry {
 		fmt.Println(STYLE_RED + "Not applying anything, since this is a dry run." + STYLE_RESET)
 	} else {
-		applyChanges(allChanges)
+		applyChanges(allChanges, allChangesForOrgs)
 	}
 }
 
-func applyChanges(allChanges []QualifiedSecretCallsByRepo) {
+func applyChanges(allChanges []QualifiedSecretCallsByRepo, allChangesForOrgs []QualifiedSecretCallsByOrg) {
+	for _, orgChanges := range allChangesForOrgs {
+		for _, call := range orgChanges.Calls {
+			if call.Call == "delete" {
+				err := github.DeleteSecretForOrg(orgChanges.OrgName, call.SecretName)
+				if err != nil {
+					log.Printf("Error deleting secret on GitHub %v/%v: %v", orgChanges.OrgName, call.SecretName, err)
+					continue
+				}
+
+			} else if call.Call == "create" || call.Call == "update" {
+				log.Printf("repo ids %v", call.OrgRepoIds)
+				err := github.PutSecretForOrg(orgChanges.OrgName, call.SecretName, orgChanges.KeyId, call.EncryptedValue, call.OrgVisibility, call.OrgRepoIds)
+				if err != nil {
+					log.Printf("Error putting secret to GitHub %v/%v: %v", orgChanges.OrgName, call.SecretName, err)
+					continue
+				}
+
+			}
+		}
+	}
+
 	for _, repoChanges := range allChanges {
 		for _, call := range repoChanges.Calls {
 			if call.Call == "delete" {
-				err := deleteSecret(repoChanges.RepoOwner, repoChanges.RepoName, call.SecretName)
+				err := github.DeleteSecret(repoChanges.RepoOwner, repoChanges.RepoName, call.SecretName)
 				if err != nil {
 					log.Printf("Error deleting secret on GitHub %v/%v/%v: %v", repoChanges.RepoOwner, repoChanges.RepoName, call.SecretName, err)
 					continue
 				}
 
 			} else if call.Call == "create" || call.Call == "update" {
-				err := putSecret(repoChanges.RepoOwner, repoChanges.RepoName, call.SecretName, repoChanges.KeyId, call.EncryptedValue)
+				err := github.PutSecret(repoChanges.RepoOwner, repoChanges.RepoName, call.SecretName, repoChanges.KeyId, call.EncryptedValue)
 				if err != nil {
 					log.Printf("Error putting secret to GitHub %v/%v/%v: %v", repoChanges.RepoOwner, repoChanges.RepoName, call.SecretName, err)
 					continue
@@ -216,11 +300,7 @@ func applyChanges(allChanges []QualifiedSecretCallsByRepo) {
 }
 
 func parseArgs(args []string) InvokeArgs {
-	ia := &InvokeArgs{
-		Action: "",
-		IsDry:  false,
-		Files:  nil,
-	}
+	ia := &InvokeArgs{}
 
 	state := ""
 
@@ -258,8 +338,9 @@ func computeCalls(spec SyncSpecRepo, publicKey PublicKey, isDry bool) *Qualified
 		existingSecretNames[name] = nil
 	}
 
-	for name, value := range spec.Secrets {
-		stringValue, err := value.GetRealizedValue()
+	for _, valueSpec := range spec.Secrets {
+		name := valueSpec.Name
+		stringValue, err := valueSpec.GetRealizedValue()
 		if err != nil {
 			log.Printf("Error getting realized value %v/%v/%v: %v", spec.Owner, spec.Name, name, err)
 			continue
@@ -299,6 +380,98 @@ func computeCalls(spec SyncSpecRepo, publicKey PublicKey, isDry bool) *Qualified
 	return changes
 }
 
+func computeCallsForOrg(spec SyncSpecOrg, publicKey PublicKey, isDry bool) *QualifiedSecretCallsByOrg {
+	changes := &QualifiedSecretCallsByOrg{
+		KeyId:   publicKey.KeyId,
+		OrgName: spec.Name,
+		Calls:   []QualifiedSecretCall{},
+	}
+
+	existingSecretNames := map[string]interface{}{}
+
+	for _, name := range getSecretListForOrg(spec.Name) {
+		existingSecretNames[name] = nil
+	}
+
+	repoIds := getRepoIdsForOrg(spec.Name)
+
+	for _, valueSpec := range spec.Secrets {
+		name := valueSpec.Name
+		stringValue, err := valueSpec.GetRealizedValue()
+		if err != nil {
+			log.Printf("Error getting realized value %v/%v: %v", spec.Name, name, err)
+			continue
+		}
+
+		encryptedValue, err := encrypt(publicKey.Key, stringValue)
+		if err != nil {
+			log.Printf("Error encrypting value for secret %v/%v: %v", spec.Name, name, err)
+			continue
+		}
+
+		var thisRepoIds []int
+		if valueSpec.OrgVisibility == "selected" {
+			thisRepoIds = []int{}
+			for _, selectedRepoName := range valueSpec.OrgSelectedRepos {
+				thisRepoIds = append(thisRepoIds, repoIds[selectedRepoName])
+			}
+		}
+
+		call := "create"
+		if _, ok := existingSecretNames[name]; ok {
+			call = "update"
+		}
+
+		changes.Calls = append(changes.Calls, QualifiedSecretCall{
+			Call:           call,
+			SecretName:     name,
+			EncryptedValue: encryptedValue,
+			OrgVisibility:  valueSpec.OrgVisibility,
+			OrgRepoIds:     thisRepoIds,
+		})
+
+		if spec.Delete {
+			delete(existingSecretNames, name)
+		}
+	}
+
+	if spec.Delete {
+		for name, _ := range existingSecretNames {
+			changes.Calls = append(changes.Calls, QualifiedSecretCall{
+				Call:       "delete",
+				SecretName: name,
+			})
+		}
+	}
+
+	return changes
+}
+
+func getRepoIdsForOrg(name string) map[string]int {
+	body, err := github.MakeGitHubRequest("GET", "orgs/"+name+"/repos?per_page=100", nil)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	type Repo struct {
+		Id   int
+		Name string
+	}
+
+	repos := []Repo{}
+	err = json.Unmarshal(body, &repos)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	repoIdsByName := map[string]int{}
+	for _, repo := range repos {
+		repoIdsByName[repo.Name] = repo.Id
+	}
+
+	return repoIdsByName
+}
+
 func encrypt(key, value string) (string, error) {
 	decodedKey, err := base64.StdEncoding.DecodeString(key)
 	if err != nil {
@@ -315,20 +488,53 @@ func encrypt(key, value string) (string, error) {
 }
 
 func getSecretList(owner, repo string) []string {
-	body, err := makeGithubRequest("GET", "repos/"+owner+"/"+repo+"/actions/secrets", nil)
+	body, err := github.MakeGitHubRequest("GET", "repos/"+owner+"/"+repo+"/actions/secrets", nil)
 	if err != nil {
 		log.Fatalln(err)
 	}
 
 	type Secret struct {
-		Name      string `json:"name"`
+		Name      string
 		CreatedAt string `json:"created_at"`
 		UpdatedAt string `json:"updated_at"`
 	}
 
 	type Response struct {
-		TotalCount int      `json:"total_count"`
-		Secrets    []Secret `json:"secrets"`
+		TotalCount int `json:"total_count"`
+		Secrets    []Secret
+	}
+
+	var response Response
+	err = json.Unmarshal(body, &response)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	names := []string{}
+	for _, secret := range response.Secrets {
+		names = append(names, secret.Name)
+	}
+
+	return names
+}
+
+func getSecretListForOrg(name string) []string {
+	body, err := github.MakeGitHubRequest("GET", "orgs/"+name+"/actions/secrets", nil)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	type Secret struct {
+		Name                string
+		CreatedAt           string `json:"created_at"`
+		UpdatedAt           string `json:"updated_at"`
+		OrgVisibility       string `json:"visibility"`
+		OrgSelectedReposUrl string `json:"selected_repositories_url"`
+	}
+
+	type Response struct {
+		TotalCount int `json:"total_count"`
+		Secrets    []Secret
 	}
 
 	var response Response
@@ -346,7 +552,7 @@ func getSecretList(owner, repo string) []string {
 }
 
 func getPublicKey(owner, repo string) PublicKey {
-	body, err := makeGithubRequest("GET", "repos/"+owner+"/"+repo+"/actions/secrets/public-key", nil)
+	body, err := github.MakeGitHubRequest("GET", "repos/"+owner+"/"+repo+"/actions/secrets/public-key", nil)
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -360,62 +566,19 @@ func getPublicKey(owner, repo string) PublicKey {
 	return response
 }
 
-func putSecret(owner, repo, secretName, keyId, encryptedValueStr string) error {
-	body := map[string]string{
-		"encrypted_value": encryptedValueStr,
-		"key_id":          keyId,
-	}
-
-	_, err := makeGithubRequest("PUT", "repos/"+owner+"/"+repo+"/actions/secrets/"+secretName, body)
+func getPublicKeyForOrg(name string) PublicKey {
+	body, err := github.MakeGitHubRequest("GET", "orgs/"+name+"/actions/secrets/public-key", nil)
 	if err != nil {
-		return err
+		log.Fatalln(err)
 	}
 
-	return nil
-}
-
-func deleteSecret(owner, repo, secretName string) error {
-	_, err := makeGithubRequest("DELETE", "repos/"+owner+"/"+repo+"/actions/secrets/"+secretName, nil)
+	response := PublicKey{}
+	err = json.Unmarshal(body, &response)
 	if err != nil {
-		return err
+		log.Fatalln(err)
 	}
 
-	return nil
-}
-
-func makeGithubRequest(method, path string, body interface{}) ([]byte, error) {
-	var requestBody io.Reader
-	if body != nil {
-		data, err := json.Marshal(body)
-		if err != nil {
-			return nil, err
-		}
-		requestBody = bytes.NewBuffer(data)
-	}
-
-	req, err := http.NewRequest(method, "https://api.github.com/"+path, requestBody)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Add("Accept", "application/vnd.github.v3+json")
-	req.Header.Add("Authorization", "Bearer "+GITHUB_TOKEN)
-
-	if body != nil {
-		req.Header.Add("Content-Type", "application/json")
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-
-	responseBody, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	return responseBody, nil
+	return response
 }
 
 func loadYaml(filename string) SyncSpec {
@@ -442,7 +605,7 @@ func getUsedSecrets(owner, repo string) (map[string]map[string]interface{}, erro
 		DownloadURL string `json:"download_url"`
 	}
 
-	body, _ := makeGithubRequest("GET", "repos/"+owner+"/"+repo+"/contents/.github/workflows", nil)
+	body, _ := github.MakeGitHubRequest("GET", "repos/"+owner+"/"+repo+"/contents/.github/workflows", nil)
 
 	items := []Item{}
 	err := json.Unmarshal(body, &items)
