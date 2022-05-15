@@ -47,13 +47,13 @@ func MakeGitHubRequest(method, path string, body interface{}) ([]byte, error) {
 	return responseBody, nil
 }
 
-func PutSecret(owner, repo, secretName, keyId, encryptedValueStr string) error {
+func PutSecret(fullRepoName, secretName, keyId, encryptedValueStr string) error {
 	body := map[string]string{
 		"encrypted_value": encryptedValueStr,
 		"key_id":          keyId,
 	}
 
-	_, err := MakeGitHubRequest("PUT", "repos/"+owner+"/"+repo+"/actions/secrets/"+secretName, body)
+	_, err := MakeGitHubRequest("PUT", "repos/"+fullRepoName+"/actions/secrets/"+secretName, body)
 	if err != nil {
 		return err
 	}
@@ -82,8 +82,8 @@ func PutSecretForOrg(name, secretName, keyId, encryptedValueStr, visibility stri
 	return nil
 }
 
-func DeleteSecret(owner, repo, secretName string) error {
-	_, err := MakeGitHubRequest("DELETE", "repos/"+owner+"/"+repo+"/actions/secrets/"+secretName, nil)
+func DeleteSecret(fullRepoName, secretName string) error {
+	_, err := MakeGitHubRequest("DELETE", "repos/"+fullRepoName+"/actions/secrets/"+secretName, nil)
 	if err != nil {
 		return err
 	}

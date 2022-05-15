@@ -39,11 +39,10 @@ type PublicKey struct {
 type SecretValue struct {
 	Type    string
 	Value   string
-	FromEnv string
+	FromEnv string `yaml:"from_env"`
 }
 
 type SecretValueSpec struct {
-	Name             string
 	Value            string
 	FromEnv          string
 	OrgVisibility    string   `yaml:"visibility"`
@@ -51,30 +50,29 @@ type SecretValueSpec struct {
 }
 
 type SyncSpecRepo struct {
-	Owner   string
-	Name    string
 	Delete  bool `yaml:"delete_unspecified"`
-	Secrets []SecretValueSpec
+	Secrets map[string]SecretValueSpec
+	Envs map[string]struct {
+		secrets map[string]SecretValueSpec
+	}
 }
 
 type SyncSpecOrg struct {
-	Name    string
 	Delete  bool `yaml:"delete_unspecified"`
-	Secrets []SecretValueSpec
+	Secrets map[string]SecretValueSpec
 }
 
 type SyncSpec struct {
 	Vars  interface{}
-	Repos []SyncSpecRepo
-	Orgs  []SyncSpecOrg
+	Repos map[string]SyncSpecRepo
+	Orgs  map[string]SyncSpecOrg
 }
 
 type QualifiedSecretCallsByRepo struct {
-	KeyId       string
-	RepoOwner   string
-	RepoName    string
-	Calls       []QualifiedSecretCall
-	UsedSecrets map[string]map[string]interface{}
+	KeyId        string
+	FullRepoName string
+	Calls        []QualifiedSecretCall
+	UsedSecrets  map[string]map[string]interface{}
 }
 
 type QualifiedSecretCallsByOrg struct {
@@ -129,17 +127,17 @@ func main() {
 	for _, file := range ia.Files {
 		secretsConfig := loadYaml(file)
 
-		for _, repo := range secretsConfig.Repos {
-			publicKey := getPublicKey(repo.Owner, repo.Name)
-			thisRepoChanges := computeCalls(repo, publicKey, ia.IsDry)
+		for repoName, repo := range secretsConfig.Repos {
+			publicKey := getPublicKey(repoName)
+			thisRepoChanges := computeCalls(repoName, repo, publicKey, ia.IsDry)
 			thisRepoChanges.KeyId = publicKey.KeyId
-			thisRepoChanges.UsedSecrets, _ = getUsedSecrets(repo.Owner, repo.Name)
+			thisRepoChanges.UsedSecrets, _ = getUsedSecrets(repoName)
 			allChanges = append(allChanges, *thisRepoChanges)
 		}
 
-		for _, org := range secretsConfig.Orgs {
-			publicKey := getPublicKeyForOrg(org.Name)
-			thisOrgChanges := computeCallsForOrg(org, publicKey, ia.IsDry)
+		for name, org := range secretsConfig.Orgs {
+			publicKey := getPublicKeyForOrg(name)
+			thisOrgChanges := computeCallsForOrg(name, org, publicKey, ia.IsDry)
 			thisOrgChanges.KeyId = publicKey.KeyId
 			// thisOrgChanges.UsedSecrets, _ = getUsedSecrets(org.Name)
 			allChangesForOrgs = append(allChangesForOrgs, *thisOrgChanges)
@@ -197,7 +195,7 @@ func main() {
 	}
 
 	for _, repo := range allChanges {
-		fmt.Println(STYLE_BOLD + "repo " + repo.RepoOwner + "/" + repo.RepoName + STYLE_RESET)
+		fmt.Println(STYLE_BOLD + "repo " + repo.FullRepoName + STYLE_RESET)
 
 		specifiedSecrets := map[string]interface{}{}
 
@@ -281,16 +279,16 @@ func applyChanges(allChanges []QualifiedSecretCallsByRepo, allChangesForOrgs []Q
 	for _, repoChanges := range allChanges {
 		for _, call := range repoChanges.Calls {
 			if call.Call == "delete" {
-				err := github.DeleteSecret(repoChanges.RepoOwner, repoChanges.RepoName, call.SecretName)
+				err := github.DeleteSecret(repoChanges.FullRepoName, call.SecretName)
 				if err != nil {
-					log.Printf("Error deleting secret on GitHub %v/%v/%v: %v", repoChanges.RepoOwner, repoChanges.RepoName, call.SecretName, err)
+					log.Printf("Error deleting secret on GitHub %v/%v: %v", repoChanges.FullRepoName, call.SecretName, err)
 					continue
 				}
 
 			} else if call.Call == "create" || call.Call == "update" {
-				err := github.PutSecret(repoChanges.RepoOwner, repoChanges.RepoName, call.SecretName, repoChanges.KeyId, call.EncryptedValue)
+				err := github.PutSecret(repoChanges.FullRepoName, call.SecretName, repoChanges.KeyId, call.EncryptedValue)
 				if err != nil {
-					log.Printf("Error putting secret to GitHub %v/%v/%v: %v", repoChanges.RepoOwner, repoChanges.RepoName, call.SecretName, err)
+					log.Printf("Error putting secret to GitHub %v/%v: %v", repoChanges.FullRepoName, call.SecretName, err)
 					continue
 				}
 
@@ -324,31 +322,29 @@ func parseArgs(args []string) InvokeArgs {
 	return *ia
 }
 
-func computeCalls(spec SyncSpecRepo, publicKey PublicKey, isDry bool) *QualifiedSecretCallsByRepo {
+func computeCalls(fullRepoName string, spec SyncSpecRepo, publicKey PublicKey, isDry bool) *QualifiedSecretCallsByRepo {
 	changes := &QualifiedSecretCallsByRepo{
-		KeyId:     publicKey.KeyId,
-		RepoOwner: spec.Owner,
-		RepoName:  spec.Name,
-		Calls:     []QualifiedSecretCall{},
+		KeyId:        publicKey.KeyId,
+		FullRepoName: fullRepoName,
+		Calls:        []QualifiedSecretCall{},
 	}
 
 	existingSecretNames := map[string]interface{}{}
 
-	for _, name := range getSecretList(spec.Owner, spec.Name) {
+	for _, name := range getSecretList(fullRepoName) {
 		existingSecretNames[name] = nil
 	}
 
-	for _, valueSpec := range spec.Secrets {
-		name := valueSpec.Name
+	for name, valueSpec := range spec.Secrets {
 		stringValue, err := valueSpec.GetRealizedValue()
 		if err != nil {
-			log.Printf("Error getting realized value %v/%v/%v: %v", spec.Owner, spec.Name, name, err)
+			log.Printf("Error getting realized value %v/%v: %v", fullRepoName, name, err)
 			continue
 		}
 
 		encryptedValue, err := encrypt(publicKey.Key, stringValue)
 		if err != nil {
-			log.Printf("Error encrypting value for secret %v/%v/%v: %v", spec.Owner, spec.Name, name, err)
+			log.Printf("Error encrypting value for secret %v/%v: %v", fullRepoName, name, err)
 			continue
 		}
 
@@ -380,32 +376,31 @@ func computeCalls(spec SyncSpecRepo, publicKey PublicKey, isDry bool) *Qualified
 	return changes
 }
 
-func computeCallsForOrg(spec SyncSpecOrg, publicKey PublicKey, isDry bool) *QualifiedSecretCallsByOrg {
+func computeCallsForOrg(orgName string, spec SyncSpecOrg, publicKey PublicKey, isDry bool) *QualifiedSecretCallsByOrg {
 	changes := &QualifiedSecretCallsByOrg{
 		KeyId:   publicKey.KeyId,
-		OrgName: spec.Name,
+		OrgName: orgName,
 		Calls:   []QualifiedSecretCall{},
 	}
 
 	existingSecretNames := map[string]interface{}{}
 
-	for _, name := range getSecretListForOrg(spec.Name) {
+	for _, name := range getSecretListForOrg(orgName) {
 		existingSecretNames[name] = nil
 	}
 
-	repoIds := getRepoIdsForOrg(spec.Name)
+	repoIds := getRepoIdsForOrg(orgName)
 
-	for _, valueSpec := range spec.Secrets {
-		name := valueSpec.Name
+	for name, valueSpec := range spec.Secrets {
 		stringValue, err := valueSpec.GetRealizedValue()
 		if err != nil {
-			log.Printf("Error getting realized value %v/%v: %v", spec.Name, name, err)
+			log.Printf("Error getting realized value %v/%v: %v", orgName, name, err)
 			continue
 		}
 
 		encryptedValue, err := encrypt(publicKey.Key, stringValue)
 		if err != nil {
-			log.Printf("Error encrypting value for secret %v/%v: %v", spec.Name, name, err)
+			log.Printf("Error encrypting value for secret %v/%v: %v", orgName, name, err)
 			continue
 		}
 
@@ -487,8 +482,8 @@ func encrypt(key, value string) (string, error) {
 	return base64.StdEncoding.EncodeToString(encryptedValue), nil
 }
 
-func getSecretList(owner, repo string) []string {
-	body, err := github.MakeGitHubRequest("GET", "repos/"+owner+"/"+repo+"/actions/secrets", nil)
+func getSecretList(fullRepoName string) []string {
+	body, err := github.MakeGitHubRequest("GET", "repos/"+fullRepoName+"/actions/secrets", nil)
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -551,8 +546,8 @@ func getSecretListForOrg(name string) []string {
 	return names
 }
 
-func getPublicKey(owner, repo string) PublicKey {
-	body, err := github.MakeGitHubRequest("GET", "repos/"+owner+"/"+repo+"/actions/secrets/public-key", nil)
+func getPublicKey(fullRepoName string) PublicKey {
+	body, err := github.MakeGitHubRequest("GET", "repos/"+fullRepoName+"/actions/secrets/public-key", nil)
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -599,13 +594,13 @@ func loadYaml(filename string) SyncSpec {
 	return data
 }
 
-func getUsedSecrets(owner, repo string) (map[string]map[string]interface{}, error) {
+func getUsedSecrets(fullRepoName string) (map[string]map[string]interface{}, error) {
 	type Item struct {
 		Name        string
 		DownloadURL string `json:"download_url"`
 	}
 
-	body, _ := github.MakeGitHubRequest("GET", "repos/"+owner+"/"+repo+"/contents/.github/workflows", nil)
+	body, _ := github.MakeGitHubRequest("GET", "repos/"+fullRepoName+"/contents/.github/workflows", nil)
 
 	items := []Item{}
 	err := json.Unmarshal(body, &items)

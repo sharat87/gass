@@ -4,22 +4,22 @@ A tiny tool to set secrets for one or more GitHub repos, as specified in a YAML 
 
 ```yaml
 repos:
-  - owner: sharat87
-    name: prestige
+  sharat87/prestige:
     delete_unspecified: false  # If true, delete any secrets not mentioned in the below `secrets` list. Defaults to `false` if not specified.
     secrets:
       SOME_SECRET_NAME: super-secret-value
 
-  - owner: sharat87
-    name: just-a-calendar
+  sharat87/just-a-calendar:
     delete_unspecified: false
     secrets:
-      ANOTHER_SECRET: value1
-      SOME_LONG_SSH_KEY: |
-        some long ssh key value
-        here that goes on for
-        several lines
-        and then some
+      ANOTHER_SECRET:
+        value: value1
+      SOME_LONG_SSH_KEY:
+        value: |
+          some long ssh key value
+          here that goes on for
+          several lines
+          and then some
 ```
 
 Now run the following in the folder where `secrets.yml` is located, and all secrets in the specified repositories will be updated to the specified values.
@@ -34,7 +34,7 @@ Additionally, instead of providing the secret values directly in the YAML file, 
 
 ```yaml
 SECRET_NAME:
-  fromEnv: SECRET_VALUE_ENV_NAME
+  from_env: SECRET_VALUE_ENV_NAME
 ```
 
 Note that since GitHub doesn't let us see the current value of a secret, we have to update all secret values to ensure they are correct. So the last updated time of all secrets will change every time this program is run, and will also be more-or-less the same.
@@ -75,20 +75,23 @@ vars:  # Ignored by gass.
 
 repos:
 
-  - owner: sharat87
-    name: prestige
+  sharat87/prestige:
     delete_unspecified: true
     secrets:
-      AWS_ACCESS_KEY_ID: *artifacts_aws_key
-      AWS_SECRET_ACCESS_KEY: *artifacts_aws_secret
-      SOME_OTHER_SECRET: "a-super-awesome-secret"
+      AWS_ACCESS_KEY_ID:
+        value: *artifacts_aws_key
+      AWS_SECRET_ACCESS_KEY:
+        value: *artifacts_aws_secret
+      SOME_OTHER_SECRET:
+        value: "a-super-awesome-secret"
 
-  - owner: sharat87
-    name: httpbun
+  sharat87/httpbun:
     delete_unspecified: true
     secrets:
-      AWS_ACCESS_KEY_ID: *artifacts_aws_key
-      AWS_SECRET_ACCESS_KEY: *artifacts_aws_secret
+      AWS_ACCESS_KEY_ID:
+        value: *artifacts_aws_key
+      AWS_SECRET_ACCESS_KEY:
+        value: *artifacts_aws_secret
 ```
 
 This will work as you can guess. The parts `*artifacts_aws_...` will be replaced by their corresponding value under `vars`. We can actually simplify this even further, at a slight cost of making it a little less readable perhaps:
@@ -96,20 +99,21 @@ This will work as you can guess. The parts `*artifacts_aws_...` will be replaced
 ```yaml
 vars:  # Ignored by gass.
   - &artifacts_aws
-    AWS_ACCESS_KEY_ID: "abcdef-key-id"
-    AWS_SECRET_ACCESS_KEY: "abcdef-secret-key"
+    AWS_ACCESS_KEY_ID:
+      value: "abcdef-key-id"
+    AWS_SECRET_ACCESS_KEY:
+      value: "abcdef-secret-key"
 
 repos:
 
-  - owner: sharat87
-    name: prestige
+  sharat87/prestige:
     delete_unspecified: true
     secrets:
       <<: *artifacts_aws
-      SOME_OTHER_SECRET: "a-super-awesome-secret"
+      SOME_OTHER_SECRET:
+        value: "a-super-awesome-secret"
 
-  - owner: sharat87
-    name: httpbun
+  sharat87:httpbun
     delete_unspecified: true
     secrets:
       <<: *artifacts_aws
