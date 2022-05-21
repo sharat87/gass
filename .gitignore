@@ -1,5 +1,5 @@
 /.env
 /bin
-secrets.yml
+secrets*.yml
 
 .DS_Store

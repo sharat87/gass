@@ -17,6 +17,12 @@ import (
 	"strings"
 )
 
+var ( // Injected at biuld time.
+	Version string
+	Commit  string
+	Date    string
+)
+
 // Styles codes from <https://stackoverflow.com/a/33206814/151048>.
 const STYLE_RESET = "\033[0m"
 const STYLE_RED = "\033[31m"
@@ -29,6 +35,11 @@ const STYLE_REVERSE = "\033[7m"
 type InvokeArgs struct {
 	IsDry bool
 	Files []string
+}
+
+type GithubResponseError struct {
+	Message          string
+	DocumentationUrl string `json:"documentation_url"`
 }
 
 type PublicKey struct {
@@ -49,12 +60,14 @@ type SecretValueSpec struct {
 	OrgSelectedRepos []string `yaml:"selected_repos"`
 }
 
+type SecretPack struct {
+	Secrets map[string]SecretValueSpec
+}
+
 type SyncSpecRepo struct {
 	Delete  bool `yaml:"delete_unspecified"`
 	Secrets map[string]SecretValueSpec
-	Envs map[string]struct {
-		secrets map[string]SecretValueSpec
-	}
+	Envs    map[string]SecretPack
 }
 
 type SyncSpecOrg struct {
@@ -73,6 +86,12 @@ type QualifiedSecretCallsByRepo struct {
 	FullRepoName string
 	Calls        []QualifiedSecretCall
 	UsedSecrets  map[string]map[string]interface{}
+	Envs         map[string]QualifiedSecretCallsByRepoEnv
+}
+
+type QualifiedSecretCallsByRepoEnv struct {
+	Calls       []QualifiedSecretCall
+	UsedSecrets map[string]map[string]interface{}
 }
 
 type QualifiedSecretCallsByOrg struct {
@@ -111,6 +130,8 @@ func (sv SecretValueSpec) GetRealizedValue() (string, error) {
 
 func main() {
 	ia := parseArgs(os.Args[1:])
+
+	fmt.Printf("gass version:%v commit:%v built:%v\n", Version, Commit, Date)
 
 	if ia.Files == nil {
 		log.Println("Please specify at least one `--file`.")
@@ -238,6 +259,42 @@ func main() {
 			}
 		}
 
+		for envName, envChanges := range repo.Envs {
+			fmt.Println("\t" + STYLE_BOLD + "env " + envName + STYLE_RESET)
+			for _, call := range envChanges.Calls {
+				if call.Call == "delete" {
+					msg := "\t\t" + STYLE_RED + "deleted\t" + call.SecretName
+
+					if _, ok := repo.UsedSecrets[call.SecretName]; ok {
+						isUsedSecretsSetForDeletion += 1
+						msg += STYLE_BOLD + " " + STYLE_REVERSE + "(used in "
+						isFirst := true
+						for file, _ := range repo.UsedSecrets[call.SecretName] {
+							msg += "'" + file + "'"
+							if !isFirst {
+								msg += ", "
+							}
+							isFirst = false
+						}
+						msg += ")"
+					}
+
+					fmt.Println(msg + STYLE_RESET)
+
+				} else if call.Call == "create" {
+					// TODO: Check if this is an unused secret, and if yes, show a info message.
+					fmt.Println("\t\t" + STYLE_GREEN + "created\t" + call.SecretName + STYLE_RESET)
+					specifiedSecrets[call.SecretName] = nil
+
+				} else if call.Call == "update" {
+					// TODO: Check if this is an unused secret, and if yes, show a info message.
+					fmt.Println("\t\t" + STYLE_BLUE + "updated\t" + call.SecretName + STYLE_RESET)
+					specifiedSecrets[call.SecretName] = nil
+
+				}
+			}
+		}
+
 		fmt.Println("")
 	}
 
@@ -247,6 +304,7 @@ func main() {
 		)
 	}
 
+	// TODO: Before applying anything, ensure all required things exist, like repos, orgs, envs etc.
 	if ia.IsDry {
 		fmt.Println(STYLE_RED + "Not applying anything, since this is a dry run." + STYLE_RESET)
 	} else {
@@ -294,6 +352,26 @@ func applyChanges(allChanges []QualifiedSecretCallsByRepo, allChangesForOrgs []Q
 
 			}
 		}
+
+		for envName, envChanges := range repoChanges.Envs {
+			for _, call := range envChanges.Calls {
+				if call.Call == "delete" {
+					err := github.DeleteSecretForEnv(repoChanges.FullRepoName, envName, call.SecretName)
+					if err != nil {
+						log.Printf("Error deleting env secret on GitHub %v/%v/%v: %v", repoChanges.FullRepoName, envName, call.SecretName, err)
+						continue
+					}
+
+				} else if call.Call == "create" || call.Call == "update" {
+					err := github.PutSecretForEnv(repoChanges.FullRepoName, envName, call.SecretName, repoChanges.KeyId, call.EncryptedValue)
+					if err != nil {
+						log.Printf("Error putting env secret to GitHub %v/%v/%v: %v", repoChanges.FullRepoName, envName, call.SecretName, err)
+						continue
+					}
+
+				}
+			}
+		}
 	}
 }
 
@@ -327,6 +405,10 @@ func computeCalls(fullRepoName string, spec SyncSpecRepo, publicKey PublicKey, i
 		KeyId:        publicKey.KeyId,
 		FullRepoName: fullRepoName,
 		Calls:        []QualifiedSecretCall{},
+	}
+
+	if spec.Envs != nil {
+		changes.Envs = map[string]QualifiedSecretCallsByRepoEnv{}
 	}
 
 	existingSecretNames := map[string]interface{}{}
@@ -371,6 +453,59 @@ func computeCalls(fullRepoName string, spec SyncSpecRepo, publicKey PublicKey, i
 				SecretName: name,
 			})
 		}
+	}
+
+	for envName, secretPack := range spec.Envs {
+		envChanges := QualifiedSecretCallsByRepoEnv{
+			Calls: []QualifiedSecretCall{},
+		}
+
+		existingSecretNamesForEnv := map[string]interface{}{}
+
+		for _, name := range getSecretListForEnv(fullRepoName, envName) {
+			existingSecretNamesForEnv[name] = nil
+		}
+
+		for name, valueSpec := range secretPack.Secrets {
+			stringValue, err := valueSpec.GetRealizedValue()
+			if err != nil {
+				log.Printf("Error getting realized value %v/%v: %v", fullRepoName, name, err)
+				continue
+			}
+
+			encryptedValue, err := encrypt(publicKey.Key, stringValue)
+			if err != nil {
+				log.Printf("Error encrypting value for secret %v/%v: %v", fullRepoName, name, err)
+				continue
+			}
+
+			// TODO: Get secret list for this env here.
+			call := "create"
+			if _, ok := existingSecretNamesForEnv[name]; ok {
+				call = "update"
+			}
+
+			envChanges.Calls = append(envChanges.Calls, QualifiedSecretCall{
+				Call:           call,
+				SecretName:     name,
+				EncryptedValue: encryptedValue,
+			})
+
+			if spec.Delete {
+				delete(existingSecretNamesForEnv, name)
+			}
+		}
+
+		if spec.Delete {
+			for name, _ := range existingSecretNamesForEnv {
+				envChanges.Calls = append(envChanges.Calls, QualifiedSecretCall{
+					Call:       "delete",
+					SecretName: name,
+				})
+			}
+		}
+
+		changes.Envs[envName] = envChanges
 	}
 
 	return changes
@@ -468,10 +603,12 @@ func getRepoIdsForOrg(name string) map[string]int {
 }
 
 func encrypt(key, value string) (string, error) {
+	log.Printf("Encrypting with %v", key)
 	decodedKey, err := base64.StdEncoding.DecodeString(key)
 	if err != nil {
 		return "", err
 	}
+	log.Printf("Decoded %v %v", decodedKey, len(decodedKey))
 
 	// Ref <https://stackoverflow.com/a/67199587/151048> for syntax used in third argument.
 	encryptedValue, err := box.SealAnonymous([]byte{}, []byte(value), (*[32]byte)(decodedKey), rand.Reader)
@@ -484,6 +621,52 @@ func encrypt(key, value string) (string, error) {
 
 func getSecretList(fullRepoName string) []string {
 	body, err := github.MakeGitHubRequest("GET", "repos/"+fullRepoName+"/actions/secrets", nil)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	type Secret struct {
+		Name      string
+		CreatedAt string `json:"created_at"`
+		UpdatedAt string `json:"updated_at"`
+	}
+
+	type Response struct {
+		TotalCount int `json:"total_count"`
+		Secrets    []Secret
+	}
+
+	var response Response
+	err = json.Unmarshal(body, &response)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	names := []string{}
+	for _, secret := range response.Secrets {
+		names = append(names, secret.Name)
+	}
+
+	return names
+}
+
+func getSecretListForEnv(fullRepoName string, envName string) []string {
+	body, err := github.MakeGitHubRequest("GET", "/repos/"+fullRepoName, nil)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	type RepoResponse struct {
+		Id string
+	}
+
+	var repoResponse RepoResponse
+	err = json.Unmarshal(body, &repoResponse)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	body, err = github.MakeGitHubRequest("GET", "/repositories/"+repoResponse.Id+"/environments/"+envName+"/secrets", nil)
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -551,11 +734,23 @@ func getPublicKey(fullRepoName string) PublicKey {
 	if err != nil {
 		log.Fatalln(err)
 	}
+	log.Printf("public-key response %v", string(body))
 
 	response := PublicKey{}
 	err = json.Unmarshal(body, &response)
 	if err != nil {
-		log.Fatalln(err)
+		log.Fatalf("Error unmarshalling public-key response: %v", err)
+	}
+
+	if response.Key == "" {
+		errResponse := GithubResponseError{}
+		err = json.Unmarshal(body, &errResponse)
+		if err != nil {
+			log.Fatalf("Error unmarshalling public-key error response: %v", err)
+		}
+		if errResponse.Message != "" {
+			log.Printf("Error getting public-key for %v: %v", fullRepoName, errResponse.Message)
+		}
 	}
 
 	return response
@@ -566,11 +761,23 @@ func getPublicKeyForOrg(name string) PublicKey {
 	if err != nil {
 		log.Fatalln(err)
 	}
+	log.Printf("public-key for org response %v", string(body))
 
 	response := PublicKey{}
 	err = json.Unmarshal(body, &response)
 	if err != nil {
-		log.Fatalln(err)
+		log.Fatalf("Error unmarshalling public-key for org response: %v", err)
+	}
+
+	if response.Key == "" {
+		errResponse := GithubResponseError{}
+		err = json.Unmarshal(body, &errResponse)
+		if err != nil {
+			log.Fatalf("Error unmarshalling public-key for org error response: %v", err)
+		}
+		if errResponse.Message != "" {
+			log.Printf("Error getting public-key for org %v: %v", name, errResponse.Message)
+		}
 	}
 
 	return response
@@ -600,17 +807,30 @@ func getUsedSecrets(fullRepoName string) (map[string]map[string]interface{}, err
 		DownloadURL string `json:"download_url"`
 	}
 
+	filesBySecret := map[string]map[string]interface{}{}
+
 	body, _ := github.MakeGitHubRequest("GET", "repos/"+fullRepoName+"/contents/.github/workflows", nil)
 
 	items := []Item{}
 	err := json.Unmarshal(body, &items)
 	if err != nil {
-		log.Fatalln(err)
+		errResponse := GithubResponseError{}
+		err := json.Unmarshal(body, &errResponse)
+		if err != nil {
+			log.Printf("Error unmarshalling get-workflows error response: %v", err)
+		}
+		if errResponse.Message == "This repository is empty." {
+			return filesBySecret, nil
+		}
+		if errResponse.Message != "" {
+			log.Fatalf("Error getting public-key for %v: %v", fullRepoName, errResponse.Message)
+		}
+
+		log.Printf("Response from workflows: %v", string(body))
+		log.Fatalf("Getting workflows: %v", err)
 	}
 
 	secretsPat := regexp.MustCompile(`\${{\s*secrets\.([^}\s]+)\s*}}`)
-
-	filesBySecret := map[string]map[string]interface{}{}
 
 	for _, item := range items {
 		if !strings.HasSuffix(item.Name, ".yml") && !strings.HasPrefix(item.Name, ".yaml") {

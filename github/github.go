@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"strconv"
 )
 
 var GITHUB_TOKEN = os.Getenv("GITHUB_API_TOKEN")
@@ -47,6 +48,25 @@ func MakeGitHubRequest(method, path string, body interface{}) ([]byte, error) {
 	return responseBody, nil
 }
 
+func getRepoId(fullRepoName string) string {
+	body, err := MakeGitHubRequest("GET", "repos/"+fullRepoName, nil)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	type Repo struct {
+		Id   int
+	}
+
+	repo := Repo{}
+	err = json.Unmarshal(body, &repo)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	return strconv.Itoa(repo.Id)
+}
+
 func PutSecret(fullRepoName, secretName, keyId, encryptedValueStr string) error {
 	body := map[string]string{
 		"encrypted_value": encryptedValueStr,
@@ -57,6 +77,21 @@ func PutSecret(fullRepoName, secretName, keyId, encryptedValueStr string) error 
 	if err != nil {
 		return err
 	}
+
+	return nil
+}
+
+func PutSecretForEnv(fullRepoName, envName, secretName, keyId, encryptedValueStr string) error {
+	body := map[string]string{
+		"encrypted_value": encryptedValueStr,
+		"key_id":          keyId,
+	}
+
+	responseBody, err := MakeGitHubRequest("PUT", "/repositories/"+getRepoId(fullRepoName)+"/environments/"+envName+"/secrets/"+secretName, body)
+	if err != nil {
+		return err
+	}
+	log.Printf("Response from put secret for env %v/%v/%v: %v", fullRepoName, envName, secretName, string(responseBody))
 
 	return nil
 }
@@ -84,6 +119,15 @@ func PutSecretForOrg(name, secretName, keyId, encryptedValueStr, visibility stri
 
 func DeleteSecret(fullRepoName, secretName string) error {
 	_, err := MakeGitHubRequest("DELETE", "repos/"+fullRepoName+"/actions/secrets/"+secretName, nil)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func DeleteSecretForEnv(fullRepoName, envName, secretName string) error {
+	_, err := MakeGitHubRequest("DELETE", "/repositories/"+getRepoId(fullRepoName)+"/environments/"+envName+"/secrets/"+secretName, nil)
 	if err != nil {
 		return err
 	}

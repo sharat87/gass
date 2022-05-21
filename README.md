@@ -43,8 +43,8 @@ Keep your `secrets.yml` file **safe**. This is no joke.
 
 ## Features
 
-1. Set all repository secrets, with a single command run.
-1. Dry run support, that'll only show what will be done, but won't actually do any _write_ API calls.
+1. Set all repository secrets and organisation secrets with a single command run.
+1. Dry run support (`--dry`), that'll only show what will be done, but won't actually do any _write_ API calls.
 1. Specify secret values directly as plain text in the YAML file, or give the name of env variable that `gass` will read from.
 1. Configuration file is YAML so anchors and aliases can be used, if needed/interested.
 1. Detects what secrets are being used in the repository's workflows and prevents deleting any secret that's currently being used.
@@ -55,8 +55,7 @@ Keep your `secrets.yml` file **safe**. This is no joke.
 I don't intend to add a lot flexibility and features to this, and that's deliberate, conscious, and is treated as a feature. The following are things that _may_ happen in the future, when I find the time or if there's significant interest from the community.
 
 1. Tests.
-1. Support organization secrets.
-1. Support environment secrets.
+1. Support environment secrets. WIP.
 
 ## Tips
 
@@ -113,7 +112,7 @@ repos:
       SOME_OTHER_SECRET:
         value: "a-super-awesome-secret"
 
-  sharat87:httpbun
+  sharat87/httpbun:
     delete_unspecified: true
     secrets:
       <<: *artifacts_aws
