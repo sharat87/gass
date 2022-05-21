@@ -20,21 +20,30 @@ jobs:
         env:
           VERSION: ${{ github.ref_name }}
 
-      - name: Create Release
+      - name: Create release and upload artisacts
         run: |
-          curl \
-            -X POST \
-            -H "Authorization: token ${{ github.token }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            -d '{"tag_name":"${{ github.ref_name }}","draft":false,"prerelease":false,"generate_release_notes":true}' \
-            "https://api.github.com/repos/${{ github.repository }}/releases"
+          set -o errexit
+          set -o pipefail
+          set -o nounset
+          set -o xtrace
 
-      - name: Upload Artifacts
-        run: |
+          release_id="$(
+            curl \
+              -sSf \
+              -X POST \
+              -H "Authorization: token ${{ github.token }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -d '{"tag_name":"${{ github.ref_name }}","draft":false,"prerelease":false,"generate_release_notes":true}' \
+              "https://api.github.com/repos/${{ github.repository }}/releases" \
+              | grep -m1 '"id":' \
+              | grep -o '[0-9]*'
+          )"
+
           for f in bin/gass-*; do
             curl \
+              -sSf \
               -H "Authorization: token ${{ github.token }}" \
               -H "Content-Type: $(file -b --mime-type $f)" \
               --data-binary @$f \
-              "${{ create_release.upload_url }}?name=$(basename $f)"
+              "https://uploads.github.com/repos/${{ github.repository }}/releases/$release_id/assets?name=$(basename $f)"
           done
