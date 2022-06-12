@@ -52,10 +52,11 @@ Keep your `secrets.yml` file **safe**. This is no joke.
 
 ## Roadmap
 
-I don't intend to add a lot flexibility and features to this, and that's deliberate, conscious, and is treated as a feature. The following are things that _may_ happen in the future, when I find the time or if there's significant interest from the community.
-
 1. Tests.
-1. Support environment secrets. WIP.
+1. Better error reporting.
+1. Bug fixes.
+
+Yes, that's all. I don't intend to add a lot of new features to this, and that's a feature.
 
 ## Tips
 
@@ -124,7 +125,34 @@ This behaves identical to the previous YAML file.
 
 ### Auto-apply with GitHub Actions
 
-WIP
+If you keep your secrets in a private GitHub repo (which may be a good/bad idea depending on who you ask), you can use a GitHub Action like the following to auto-sync when there's a change in your secrets file.
+
+```yaml
+# /.github/workflows/gass-sync.yml
+name: Gass sync
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Run Gass
+        run: |
+          wget --no-verbose -O gass https://github.com/sharat87/gass/releases/download/v0.0.1/gass-linux-amd64
+          chmod +x gass
+          GITHUB_API_TOKEN=${{ secrets.GASS_GITHUB_API_TOKEN }} ./gass sync --file all.yml
+```
+
+Just ensure the repo with this workflow has a secret called `GASS_GITHUB_API_TOKEN`, with a valid GitHub token, and you are set.
 
 ## Contributing
 
