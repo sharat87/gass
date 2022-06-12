@@ -1,10 +1,16 @@
 LDFLAGS := -ldflags "-X main.Version=$(VERSION) -X main.Commit=$$(git rev-parse HEAD || echo) -X main.Date=$$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-run:
+run: fmt
+	if [[ -f .env ]]; then set -o allexport; source .env; fi; \
+		go run $(LDFLAGS) . --file secrets.yml
+
+test: fmt
+	go vet ./...
+	go test ./...
+
+fmt:
 	go mod tidy
 	go fmt .
-	if [[ -f .env ]]; then set -o allexport; source .env; fi; \
-		go run $(LDFLAGS) . --file secrets-bot.yml
 
 # Checkout `-buildvcs` option to `go build`, which is enabled by default.
 build: bin
@@ -18,4 +24,4 @@ build-all: bin
 bin:
 	mkdir -pv bin
 
-.PHONY: run build build-all
+.PHONY: run test fmt build build-all

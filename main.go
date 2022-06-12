@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/sharat87/gass/github"
+	"github.com/sharat87/gass/parseargs"
 	"golang.org/x/crypto/nacl/box"
 	"gopkg.in/yaml.v2"
 	"io/ioutil"
@@ -31,11 +32,6 @@ const STYLE_BLUE = "\033[34m"
 const STYLE_MAGENTA = "\033[33m"
 const STYLE_BOLD = "\033[1m"
 const STYLE_REVERSE = "\033[7m"
-
-type InvokeArgs struct {
-	IsDry bool
-	Files []string
-}
 
 type GithubResponseError struct {
 	Message          string
@@ -129,7 +125,7 @@ func (sv SecretValueSpec) GetRealizedValue() (string, error) {
 }
 
 func main() {
-	ia := parseArgs(os.Args[1:])
+	ia := parseargs.ParseArgs(os.Args[1:])
 
 	fmt.Printf("gass version:%v commit:%v built:%v\n", Version, Commit, Date)
 
@@ -139,17 +135,24 @@ func main() {
 	}
 
 	if ia.IsDry {
-		fmt.Println("\n" + STYLE_RED + "***    Dry run    ***" + STYLE_RESET + "\n")
+		fmt.Print("\n" + STYLE_RED + "***    Dry run    ***" + STYLE_RESET + "\n\n")
 	}
 
 	allChanges := []QualifiedSecretCallsByRepo{}
 	allChangesForOrgs := []QualifiedSecretCallsByOrg{}
 
+	haveErrors := false
+
 	for _, file := range ia.Files {
 		secretsConfig := loadYaml(file)
 
 		for repoName, repo := range secretsConfig.Repos {
-			publicKey := getPublicKey(repoName)
+			publicKey, err := getPublicKey(repoName)
+			if err != nil {
+				haveErrors = true
+				log.Printf("Error getting public-key for repo '%v', due to '%v'", repoName, err)
+				continue
+			}
 			thisRepoChanges := computeCalls(repoName, repo, publicKey, ia.IsDry)
 			thisRepoChanges.KeyId = publicKey.KeyId
 			thisRepoChanges.UsedSecrets, _ = getUsedSecrets(repoName)
@@ -157,12 +160,21 @@ func main() {
 		}
 
 		for name, org := range secretsConfig.Orgs {
-			publicKey := getPublicKeyForOrg(name)
+			publicKey, err := getPublicKeyForOrg(name)
+			if err != nil {
+				haveErrors = true
+				log.Printf("Error getting public-key for org '%v', due to '%v'", name, err)
+				continue
+			}
 			thisOrgChanges := computeCallsForOrg(name, org, publicKey, ia.IsDry)
 			thisOrgChanges.KeyId = publicKey.KeyId
 			// thisOrgChanges.UsedSecrets, _ = getUsedSecrets(org.Name)
 			allChangesForOrgs = append(allChangesForOrgs, *thisOrgChanges)
 		}
+	}
+
+	if haveErrors {
+		log.Fatalln("Errors detected. Not doing anything. Please rectify and retry.")
 	}
 
 	// Also find used secrets that aren't set on the repo, and aren't given in the yml file here either.
@@ -375,31 +387,6 @@ func applyChanges(allChanges []QualifiedSecretCallsByRepo, allChangesForOrgs []Q
 	}
 }
 
-func parseArgs(args []string) InvokeArgs {
-	ia := &InvokeArgs{}
-
-	state := ""
-
-	for _, arg := range args {
-		if state == "file" {
-			state = ""
-			if ia.Files == nil {
-				ia.Files = []string{}
-			}
-			ia.Files = append(ia.Files, arg)
-
-		} else if arg == "--dry" {
-			ia.IsDry = true
-
-		} else if arg == "--file" {
-			state = "file"
-
-		}
-	}
-
-	return *ia
-}
-
 func computeCalls(fullRepoName string, spec SyncSpecRepo, publicKey PublicKey, isDry bool) *QualifiedSecretCallsByRepo {
 	changes := &QualifiedSecretCallsByRepo{
 		KeyId:        publicKey.KeyId,
@@ -603,12 +590,10 @@ func getRepoIdsForOrg(name string) map[string]int {
 }
 
 func encrypt(key, value string) (string, error) {
-	log.Printf("Encrypting with %v", key)
 	decodedKey, err := base64.StdEncoding.DecodeString(key)
 	if err != nil {
 		return "", err
 	}
-	log.Printf("Decoded %v %v", decodedKey, len(decodedKey))
 
 	// Ref <https://stackoverflow.com/a/67199587/151048> for syntax used in third argument.
 	encryptedValue, err := box.SealAnonymous([]byte{}, []byte(value), (*[32]byte)(decodedKey), rand.Reader)
@@ -729,58 +714,58 @@ func getSecretListForOrg(name string) []string {
 	return names
 }
 
-func getPublicKey(fullRepoName string) PublicKey {
+func getPublicKey(fullRepoName string) (PublicKey, error) {
+	response := PublicKey{}
+
 	body, err := github.MakeGitHubRequest("GET", "repos/"+fullRepoName+"/actions/secrets/public-key", nil)
 	if err != nil {
-		log.Fatalln(err)
+		return response, err
 	}
-	log.Printf("public-key response %v", string(body))
 
-	response := PublicKey{}
 	err = json.Unmarshal(body, &response)
 	if err != nil {
-		log.Fatalf("Error unmarshalling public-key response: %v", err)
+		return response, fmt.Errorf("Error unmarshalling public-key response: %v", err)
 	}
 
 	if response.Key == "" {
 		errResponse := GithubResponseError{}
 		err = json.Unmarshal(body, &errResponse)
 		if err != nil {
-			log.Fatalf("Error unmarshalling public-key error response: %v", err)
+			return response, fmt.Errorf("Error unmarshalling public-key error response: %v", err)
 		}
 		if errResponse.Message != "" {
-			log.Printf("Error getting public-key for %v: %v", fullRepoName, errResponse.Message)
+			return response, fmt.Errorf(errResponse.Message)
 		}
 	}
 
-	return response
+	return response, nil
 }
 
-func getPublicKeyForOrg(name string) PublicKey {
+func getPublicKeyForOrg(name string) (PublicKey, error) {
+	response := PublicKey{}
+
 	body, err := github.MakeGitHubRequest("GET", "orgs/"+name+"/actions/secrets/public-key", nil)
 	if err != nil {
-		log.Fatalln(err)
+		return response, err
 	}
-	log.Printf("public-key for org response %v", string(body))
 
-	response := PublicKey{}
 	err = json.Unmarshal(body, &response)
 	if err != nil {
-		log.Fatalf("Error unmarshalling public-key for org response: %v", err)
+		return response, fmt.Errorf("Error unmarshalling public-key for org response: %v", err)
 	}
 
 	if response.Key == "" {
 		errResponse := GithubResponseError{}
 		err = json.Unmarshal(body, &errResponse)
 		if err != nil {
-			log.Fatalf("Error unmarshalling public-key for org error response: %v", err)
+			return response, fmt.Errorf("Error unmarshalling public-key error response: %v", err)
 		}
 		if errResponse.Message != "" {
-			log.Printf("Error getting public-key for org %v: %v", name, errResponse.Message)
+			return response, fmt.Errorf(errResponse.Message)
 		}
 	}
 
-	return response
+	return response, nil
 }
 
 func loadYaml(filename string) SyncSpec {
