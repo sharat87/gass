@@ -1,6 +1,7 @@
 package github
 
 import (
+	"fmt"
 	"bytes"
 	"encoding/json"
 	"io"
@@ -8,10 +9,22 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"regexp"
+	"strings"
 	"strconv"
 )
 
 var GITHUB_TOKEN = os.Getenv("GITHUB_API_TOKEN")
+
+type PublicKey struct {
+	KeyId string `json:"key_id"`
+	Key   string `json:"key"`
+}
+
+type GithubResponseError struct {
+	Message          string
+	DocumentationUrl string `json:"documentation_url"`
+}
 
 func MakeGitHubRequest(method, path string, body interface{}) ([]byte, error) {
 	var requestBody io.Reader
@@ -142,4 +155,136 @@ func DeleteSecretForOrg(name, secretName string) error {
 	}
 
 	return nil
+}
+
+func FetchPublicKey(fullRepoName string) (PublicKey, error) {
+	response := PublicKey{}
+
+	body, err := MakeGitHubRequest("GET", "repos/"+fullRepoName+"/actions/secrets/public-key", nil)
+	if err != nil {
+		return response, err
+	}
+
+	err = json.Unmarshal(body, &response)
+	if err != nil {
+		return response, fmt.Errorf("Error unmarshalling public-key response: %v", err)
+	}
+
+	if response.Key == "" {
+		errResponse := GithubResponseError{}
+		err = json.Unmarshal(body, &errResponse)
+		if err != nil {
+			return response, fmt.Errorf("Error unmarshalling public-key error response: %v", err)
+		}
+		if errResponse.Message != "" {
+			return response, fmt.Errorf(errResponse.Message)
+		}
+	}
+
+	return response, nil
+}
+
+func FetchPublicKeyForOrg(name string) (PublicKey, error) {
+	response := PublicKey{}
+
+	body, err := MakeGitHubRequest("GET", "orgs/"+name+"/actions/secrets/public-key", nil)
+	if err != nil {
+		return response, err
+	}
+
+	err = json.Unmarshal(body, &response)
+	if err != nil {
+		return response, fmt.Errorf("Error unmarshalling public-key for org response: %v", err)
+	}
+
+	if response.Key == "" {
+		errResponse := GithubResponseError{}
+		err = json.Unmarshal(body, &errResponse)
+		if err != nil {
+			return response, fmt.Errorf("Error unmarshalling public-key error response: %v", err)
+		}
+		if errResponse.Message != "" {
+			return response, fmt.Errorf(errResponse.Message)
+		}
+	}
+
+	return response, nil
+}
+
+func FetchUsedSecrets(fullRepoName string) (map[string]map[string]interface{}, error) {
+	workflows, err := downloadWorkflows(fullRepoName)
+	if err != nil {
+		return nil, err
+	}
+
+	return CollectFilesBySecret(workflows), nil
+}
+
+func downloadWorkflows(repo string) (map[string][]byte, error) {
+	type Item struct {
+		Name        string
+		DownloadURL string `json:"download_url"`
+	}
+
+	workflows := map[string][]byte{}
+
+	body, _ := MakeGitHubRequest("GET", "repos/"+repo+"/contents/.github/workflows", nil)
+
+	items := []Item{}
+	err := json.Unmarshal(body, &items)
+	if err != nil {
+		errResponse := GithubResponseError{}
+		err := json.Unmarshal(body, &errResponse)
+		if err != nil {
+			return nil, err
+		}
+
+		if errResponse.Message == "This repository is empty." {
+			// To us, an empty repository is not an error.
+			return workflows, nil
+		}
+
+		if errResponse.Message == "" {
+			return nil, fmt.Errorf("Empty error message getting workflow file list")
+		}
+
+		return nil, fmt.Errorf(errResponse.Message)
+	}
+
+	for _, item := range items {
+		if !strings.HasSuffix(item.Name, ".yml") && !strings.HasSuffix(item.Name, ".yaml") {
+			continue
+		}
+
+		resp, err := http.Get(item.DownloadURL)
+		if err != nil {
+			return nil, err
+		}
+
+		responseBody, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+
+		workflows[item.Name] = responseBody
+	}
+
+	return workflows, nil
+}
+
+func CollectFilesBySecret(workflows map[string][]byte) map[string]map[string]interface{} {
+	filesBySecret := map[string]map[string]interface{}{}
+	secretsPat := regexp.MustCompile(`\${{\s*secrets\.([^}\s]+)\s*}}`)
+
+	for filename, content := range workflows {
+		for _, match := range secretsPat.FindAllSubmatch(content, -1) {
+			secretName := string(match[1])
+			if _, ok := filesBySecret[secretName]; !ok {
+				filesBySecret[secretName] = map[string]interface{}{}
+			}
+			filesBySecret[secretName][filename] = nil
+		}
+	}
+
+	return filesBySecret
 }

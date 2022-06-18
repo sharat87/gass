@@ -161,3 +161,7 @@ Judiciously welcome. I'd appreciated if you [opened an issue](https://github.com
 ## License
 
 [MIT License](https://github.com/sharat87/gass/blob/master/LICENSE).
+
+## Other Options
+
+If you are invested in the AWS ecosystem, then you could maintain your secrets in AWS Secrets Manager, and load them into your GitHub workflows with the [AWS Secrets Manager Action](https://github.com/marketplace/actions/aws-secrets-manager-action). This is probably safer than saving them in a YAML file, depending on your situation.

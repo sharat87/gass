@@ -12,10 +12,7 @@ import (
 	"gopkg.in/yaml.v2"
 	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
-	"regexp"
-	"strings"
 )
 
 var ( // Injected at biuld time.
@@ -32,16 +29,6 @@ const STYLE_BLUE = "\033[34m"
 const STYLE_MAGENTA = "\033[33m"
 const STYLE_BOLD = "\033[1m"
 const STYLE_REVERSE = "\033[7m"
-
-type GithubResponseError struct {
-	Message          string
-	DocumentationUrl string `json:"documentation_url"`
-}
-
-type PublicKey struct {
-	KeyId string `json:"key_id"`
-	Key   string `json:"key"`
-}
 
 type SecretValue struct {
 	Type    string
@@ -147,7 +134,7 @@ func main() {
 		secretsConfig := loadYaml(file)
 
 		for repoName, repo := range secretsConfig.Repos {
-			publicKey, err := getPublicKey(repoName)
+			publicKey, err := github.FetchPublicKey(repoName)
 			if err != nil {
 				haveErrors = true
 				log.Printf("Error getting public-key for repo '%v', due to '%v'", repoName, err)
@@ -155,12 +142,12 @@ func main() {
 			}
 			thisRepoChanges := computeCalls(repoName, repo, publicKey, ia.IsDry)
 			thisRepoChanges.KeyId = publicKey.KeyId
-			thisRepoChanges.UsedSecrets, _ = getUsedSecrets(repoName)
+			thisRepoChanges.UsedSecrets, _ = github.FetchUsedSecrets(repoName)
 			allChanges = append(allChanges, *thisRepoChanges)
 		}
 
 		for name, org := range secretsConfig.Orgs {
-			publicKey, err := getPublicKeyForOrg(name)
+			publicKey, err := github.FetchPublicKeyForOrg(name)
 			if err != nil {
 				haveErrors = true
 				log.Printf("Error getting public-key for org '%v', due to '%v'", name, err)
@@ -168,7 +155,7 @@ func main() {
 			}
 			thisOrgChanges := computeCallsForOrg(name, org, publicKey, ia.IsDry)
 			thisOrgChanges.KeyId = publicKey.KeyId
-			// thisOrgChanges.UsedSecrets, _ = getUsedSecrets(org.Name)
+			// thisOrgChanges.UsedSecrets, _ = github.FetchUsedSecrets(org.Name)
 			allChangesForOrgs = append(allChangesForOrgs, *thisOrgChanges)
 		}
 	}
@@ -387,7 +374,7 @@ func applyChanges(allChanges []QualifiedSecretCallsByRepo, allChangesForOrgs []Q
 	}
 }
 
-func computeCalls(fullRepoName string, spec SyncSpecRepo, publicKey PublicKey, isDry bool) *QualifiedSecretCallsByRepo {
+func computeCalls(fullRepoName string, spec SyncSpecRepo, publicKey github.PublicKey, isDry bool) *QualifiedSecretCallsByRepo {
 	changes := &QualifiedSecretCallsByRepo{
 		KeyId:        publicKey.KeyId,
 		FullRepoName: fullRepoName,
@@ -498,7 +485,7 @@ func computeCalls(fullRepoName string, spec SyncSpecRepo, publicKey PublicKey, i
 	return changes
 }
 
-func computeCallsForOrg(orgName string, spec SyncSpecOrg, publicKey PublicKey, isDry bool) *QualifiedSecretCallsByOrg {
+func computeCallsForOrg(orgName string, spec SyncSpecOrg, publicKey github.PublicKey, isDry bool) *QualifiedSecretCallsByOrg {
 	changes := &QualifiedSecretCallsByOrg{
 		KeyId:   publicKey.KeyId,
 		OrgName: orgName,
@@ -714,60 +701,6 @@ func getSecretListForOrg(name string) []string {
 	return names
 }
 
-func getPublicKey(fullRepoName string) (PublicKey, error) {
-	response := PublicKey{}
-
-	body, err := github.MakeGitHubRequest("GET", "repos/"+fullRepoName+"/actions/secrets/public-key", nil)
-	if err != nil {
-		return response, err
-	}
-
-	err = json.Unmarshal(body, &response)
-	if err != nil {
-		return response, fmt.Errorf("Error unmarshalling public-key response: %v", err)
-	}
-
-	if response.Key == "" {
-		errResponse := GithubResponseError{}
-		err = json.Unmarshal(body, &errResponse)
-		if err != nil {
-			return response, fmt.Errorf("Error unmarshalling public-key error response: %v", err)
-		}
-		if errResponse.Message != "" {
-			return response, fmt.Errorf(errResponse.Message)
-		}
-	}
-
-	return response, nil
-}
-
-func getPublicKeyForOrg(name string) (PublicKey, error) {
-	response := PublicKey{}
-
-	body, err := github.MakeGitHubRequest("GET", "orgs/"+name+"/actions/secrets/public-key", nil)
-	if err != nil {
-		return response, err
-	}
-
-	err = json.Unmarshal(body, &response)
-	if err != nil {
-		return response, fmt.Errorf("Error unmarshalling public-key for org response: %v", err)
-	}
-
-	if response.Key == "" {
-		errResponse := GithubResponseError{}
-		err = json.Unmarshal(body, &errResponse)
-		if err != nil {
-			return response, fmt.Errorf("Error unmarshalling public-key error response: %v", err)
-		}
-		if errResponse.Message != "" {
-			return response, fmt.Errorf(errResponse.Message)
-		}
-	}
-
-	return response, nil
-}
-
 func loadYaml(filename string) SyncSpec {
 	file, err := os.Open(filename)
 	if err != nil {
@@ -784,64 +717,4 @@ func loadYaml(filename string) SyncSpec {
 	yaml.UnmarshalStrict(byteValue, &data)
 
 	return data
-}
-
-func getUsedSecrets(fullRepoName string) (map[string]map[string]interface{}, error) {
-	type Item struct {
-		Name        string
-		DownloadURL string `json:"download_url"`
-	}
-
-	filesBySecret := map[string]map[string]interface{}{}
-
-	body, _ := github.MakeGitHubRequest("GET", "repos/"+fullRepoName+"/contents/.github/workflows", nil)
-
-	items := []Item{}
-	err := json.Unmarshal(body, &items)
-	if err != nil {
-		errResponse := GithubResponseError{}
-		err := json.Unmarshal(body, &errResponse)
-		if err != nil {
-			log.Printf("Error unmarshalling get-workflows error response: %v", err)
-		}
-		if errResponse.Message == "This repository is empty." {
-			return filesBySecret, nil
-		}
-		if errResponse.Message != "" {
-			log.Fatalf("Error getting public-key for %v: %v", fullRepoName, errResponse.Message)
-		}
-
-		log.Printf("Response from workflows: %v", string(body))
-		log.Fatalf("Getting workflows: %v", err)
-	}
-
-	secretsPat := regexp.MustCompile(`\${{\s*secrets\.([^}\s]+)\s*}}`)
-
-	for _, item := range items {
-		if !strings.HasSuffix(item.Name, ".yml") && !strings.HasPrefix(item.Name, ".yaml") {
-			continue
-		}
-
-		resp, err := http.Get(item.DownloadURL)
-		if err != nil {
-			return nil, err
-		}
-
-		responseBody, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			return nil, err
-		}
-
-		for _, match := range secretsPat.FindAllSubmatch(responseBody, -1) {
-			secretName := string(match[1])
-			if _, ok := filesBySecret[secretName]; !ok {
-				filesBySecret[secretName] = map[string]interface{}{}
-			}
-			filesBySecret[secretName][item.Name] = nil
-		}
-
-		break
-	}
-
-	return filesBySecret, nil
 }
